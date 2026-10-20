@@ -1,0 +1,24 @@
+name: Escaneo diario Caja Táctica
+
+on:
+  schedule:
+    # Lunes a viernes 21:40 UTC = 18:40 hora de Argentina (Wall Street cierra 17:00/18:00 AR según horario de verano de EE.UU.)
+    - cron: "40 21 * * 1-5"
+  workflow_dispatch: {}   # botón "Run workflow" para correrlo a mano
+
+jobs:
+  escanear:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python scan.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TICKERS: ${{ vars.TICKERS }}
+          SOLO_NOVEDADES: ${{ vars.SOLO_NOVEDADES }}

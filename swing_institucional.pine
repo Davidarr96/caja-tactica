@@ -1,0 +1,225 @@
+//@version=5
+// ════════════════════════════════════════════════════════════════════
+//  SWING INSTITUCIONAL · Zonas de Valor + Huella de Volumen
+//  Caja táctica: objetivo +4% / stop -3% en activos líquidos y estables
+//  Uso recomendado: gráfico DIARIO (SPY, QQQ, JPM, GOOGL, KO, etc.)
+// ════════════════════════════════════════════════════════════════════
+indicator("Swing Institucional · Zonas de Valor + Volumen", shorttitle = "Swing Inst",
+     overlay = true, max_bars_back = 600, max_lines_count = 300,
+     max_labels_count = 300, max_boxes_count = 300)
+
+DAY_MS = 86400000
+
+// ─────────────────────────── INPUTS ───────────────────────────
+g1 = "1 · Medias institucionales"
+lenFast   = input.int(50,  "SMA rápida",  minval = 1, group = g1, inline = "f")
+colFast   = input.color(#2962FF, "",      group = g1, inline = "f")
+wFast     = input.int(2,   "Grosor",      minval = 1, maxval = 5, group = g1, inline = "f")
+lenSlow   = input.int(200, "SMA lenta",   minval = 1, group = g1, inline = "s")
+colSlow   = input.color(#FF6D00, "",      group = g1, inline = "s")
+wSlow     = input.int(3,   "Grosor",      minval = 1, maxval = 5, group = g1, inline = "s")
+zonePct   = input.float(1.0, "Tolerancia de zona (%)", minval = 0.1, step = 0.1, group = g1,
+     tooltip = "Distancia máxima entre el mínimo de la vela y la media/POC para considerar que el precio tocó la zona de valor.")
+trendMode = input.string("SMA50 > SMA200", "Filtro de tendencia",
+     options = ["SMA50 > SMA200", "Precio > SMA200", "Sin filtro"], group = g1)
+pbLook    = input.int(10, "Pullback: barras para el máximo previo", minval = 2, group = g1)
+pbMin     = input.float(2.0, "Pullback mínimo desde ese máximo (%)", minval = 0, step = 0.5, group = g1,
+     tooltip = "Confirma que el precio viene retrocediendo desde arriba y no simplemente lateralizando sobre la media.")
+
+g2 = "2 · Point of Control"
+usePOC  = input.bool(true, "Usar POC como zona de valor", group = g2)
+showPOC = input.bool(true, "Mostrar POC", group = g2, inline = "p")
+colPOC  = input.color(#AB47BC, "", group = g2, inline = "p")
+pocLen  = input.int(252, "Barras del perfil", minval = 50, maxval = 500, group = g2,
+     tooltip = "252 barras ≈ 1 año en gráfico diario. Es una aproximación del Volume Profile: el volumen de cada vela se asigna a su precio típico (HLC/3).")
+pocBins = input.int(40, "Niveles de precio del perfil", minval = 10, maxval = 100, group = g2)
+
+g3 = "3 · Huella de volumen"
+volLen  = input.int(20, "Media de volumen", minval = 1, group = g3)
+dryLen  = input.int(3, "Velas del retroceso a promediar", minval = 1, group = g3)
+dryMult = input.float(0.7, "Secado: volumen < x × media", minval = 0.1, step = 0.05, group = g3)
+expMult = input.float(1.5, "Expansión: volumen > x × media", minval = 1.0, step = 0.1, group = g3)
+wickMin = input.float(0.5, "Rechazo: mecha inferior ≥ x del rango", minval = 0.1, maxval = 0.9, step = 0.05, group = g3)
+
+g4 = "4 · Balances (Earnings)"
+useER     = input.bool(true, "Pausar operativa alrededor de balances", group = g4)
+erBefore  = input.int(7, "Días antes del reporte", minval = 0, group = g4)
+erAfter   = input.int(2, "Días después del reporte", minval = 0, group = g4)
+useManual = input.bool(false, "Usar fecha manual", group = g4, inline = "m")
+manualER  = input.time(timestamp("28 Oct 2026 00:00 +0000"), "", group = g4, inline = "m",
+     tooltip = "Útil si TradingView no tiene la fecha del próximo reporte. En ETFs (SPY/QQQ) no hay balances propios.")
+
+g5 = "5 · Gestión de riesgo"
+tpPct    = input.float(4.0, "Take Profit (%)", minval = 0.1, step = 0.5, group = g5)
+slPct    = input.float(3.0, "Stop Loss (%)",   minval = 0.1, step = 0.5, group = g5)
+projBars = input.int(15, "Barras de proyección / vigencia", minval = 2, group = g5,
+     tooltip = "Largo de las líneas de TP/SL y máximo de barras que la operación se considera activa.")
+
+g6 = "6 · Visual"
+showZones = input.bool(true, "Sombrear zonas de valor", group = g6)
+showProj  = input.bool(true, "Dibujar proyección TP / SL", group = g6)
+showDry   = input.bool(true, "Marcar secado de oferta", group = g6)
+showExp   = input.bool(true, "Marcar expansión de giro", group = g6)
+showERbg  = input.bool(true, "Sombrear ventana de balances", group = g6)
+showPanel = input.bool(true, "Panel de estado", group = g6)
+
+// ─────────────────────────── CÁLCULOS ───────────────────────────
+tol     = zonePct / 100.0
+smaFast = ta.sma(close, lenFast)
+smaSlow = ta.sma(close, lenSlow)
+volAvg  = ta.sma(volume, volLen)
+
+// --- Point of Control (perfil de volumen aproximado) ---
+pHi = ta.highest(high, pocLen)
+pLo = ta.lowest(low, pocLen)
+var float[] bins = array.new_float(pocBins, 0.0)
+float poc = na
+if usePOC and bar_index >= pocLen and pHi > pLo
+    array.fill(bins, 0.0)
+    step = (pHi - pLo) / pocBins
+    for i = 0 to pocLen - 1
+        idx = math.max(0, math.min(pocBins - 1, int((hlc3[i] - pLo) / step)))
+        array.set(bins, idx, array.get(bins, idx) + nz(volume[i]))
+    poc := pLo + step * (array.indexof(bins, array.max(bins)) + 0.5)
+
+// --- Toque de zona de valor ---
+f_touch(float lvl) =>
+    not na(lvl) and low <= lvl * (1 + tol) and close >= lvl * (1 - tol)
+
+tFast  = f_touch(smaFast)
+tSlow  = f_touch(smaSlow)
+tPOC   = usePOC and f_touch(poc)
+inZone = tFast or tSlow or tPOC
+// Nivel límite sugerido: el más alto de los tocados (el primero que encuentra el precio al bajar)
+zoneLvl = math.max(tFast ? smaFast : 0.0, tSlow ? smaSlow : 0.0, tPOC ? poc : 0.0)
+
+// --- Tendencia y retroceso ---
+trendOK = switch trendMode
+    "SMA50 > SMA200"  => smaFast > smaSlow
+    "Precio > SMA200" => close > smaSlow
+    => true
+
+recentHigh = ta.highest(high, pbLook)
+pullback   = (recentHigh - low) / recentHigh * 100 >= pbMin
+
+// --- Huella de volumen ---
+pbVol     = ta.sma(volume, dryLen)
+dryUp     = pbVol < volAvg * dryMult
+rng       = high - low
+lowerWick = math.min(open, close) - low
+rejection = rng > 0 and lowerWick / rng >= wickMin and close >= low + rng * 0.5
+volExp    = rejection and volume > volAvg * expMult
+
+// --- Ventana de balances ---
+// Histórico: fechas reales de reportes pasados + estimación del siguiente (~91 días).
+// Tiempo real: fecha del próximo reporte que publica TradingView.
+erVal = request.earnings(syminfo.tickerid, earnings.actual, barmerge.gaps_on, ignore_invalid_symbol = true)
+var int lastER = na
+if not na(erVal)
+    lastER := time
+
+futER   = earnings.future_time
+int estNext = na(lastER) ? na : lastER + 91 * DAY_MS
+int nextER  = not na(futER) and futER > time and futER - time < 100 * DAY_MS ? int(futER) : estNext
+
+erAuto   = (not na(nextER) and nextER >= time and nextER - time <= erBefore * DAY_MS) or
+     (not na(lastER) and time - lastER <= erAfter * DAY_MS)
+erManual = useManual and time >= manualER - erBefore * DAY_MS and time <= manualER + erAfter * DAY_MS
+inER     = useER and (erAuto or erManual)
+
+// ─────────────────────────── ESTADO DE LA OPERACIÓN ───────────────────────────
+var bool  active     = false
+var float entryPx    = na
+var float tpPx       = na
+var float slPx       = na
+var float supportLvl = na
+var int   entryBar   = na
+
+bool tpHit = false
+bool slHit = false
+
+// Salidas (primero se evalúa el stop: criterio conservador si ambos ocurren en la misma vela)
+if active and bar_index > entryBar
+    techBreak = close < supportLvl * (1 - tol) and volume > volAvg   // perfora soporte con volumen en aumento
+    if low <= slPx or techBreak
+        slHit  := true
+        active := false
+    else if high >= tpPx
+        tpHit  := true
+        active := false
+    else if bar_index - entryBar >= projBars
+        active := false
+
+// Entrada: zona de valor + retroceso + secado de volumen + tendencia + fuera de balances
+signal = inZone and pullback and dryUp and trendOK and not inER and not active and barstate.isconfirmed
+
+if signal
+    active     := true
+    entryPx    := zoneLvl
+    tpPx       := entryPx * (1 + tpPct / 100)
+    slPx       := entryPx * (1 - slPct / 100)
+    supportLvl := zoneLvl
+    entryBar   := bar_index
+    if showProj
+        endBar = bar_index + projBars
+        box.new(bar_index, tpPx, endBar, entryPx, border_color = color.new(color.teal, 40),
+             bgcolor = color.new(color.teal, 88))
+        box.new(bar_index, entryPx, endBar, slPx, border_color = color.new(color.red, 40),
+             bgcolor = color.new(color.red, 90))
+        line.new(bar_index, entryPx, endBar, entryPx, color = color.gray, style = line.style_dashed)
+        label.new(endBar, tpPx, "TP +" + str.tostring(tpPct) + "%  " + str.tostring(tpPx, format.mintick),
+             style = label.style_label_left, color = color.new(color.teal, 20), textcolor = color.white, size = size.small)
+        label.new(endBar, entryPx, "LMT " + str.tostring(entryPx, format.mintick),
+             style = label.style_label_left, color = color.new(color.gray, 30), textcolor = color.white, size = size.small)
+        label.new(endBar, slPx, "SL -" + str.tostring(slPct) + "%  " + str.tostring(slPx, format.mintick),
+             style = label.style_label_left, color = color.new(color.red, 20), textcolor = color.white, size = size.small)
+
+// ─────────────────────────── DIBUJO ───────────────────────────
+pFast = plot(smaFast, "SMA rápida", colFast, wFast)
+pSlow = plot(smaSlow, "SMA lenta",  colSlow, wSlow)
+plot(usePOC and showPOC ? poc : na, "POC", colPOC, 1, plot.style_stepline)
+
+zoneOn = showZones and trendOK and not inER
+pFu = plot(smaFast * (1 + tol), "Zona rápida sup", color = na, editable = false)
+pFd = plot(smaFast * (1 - tol), "Zona rápida inf", color = na, editable = false)
+pSu = plot(smaSlow * (1 + tol), "Zona lenta sup",  color = na, editable = false)
+pSd = plot(smaSlow * (1 - tol), "Zona lenta inf",  color = na, editable = false)
+fill(pFu, pFd, color = zoneOn ? color.new(colFast, 85) : na, title = "Zona de valor SMA rápida")
+fill(pSu, pSd, color = zoneOn ? color.new(colSlow, 85) : na, title = "Zona de valor SMA lenta")
+
+plotshape(showDry and dryUp and inZone and pullback and not signal, "Secado de oferta",
+     shape.circle, location.belowbar, color.new(color.aqua, 0), size = size.tiny)
+plotshape(showExp and volExp, "Expansión de giro",
+     shape.triangleup, location.belowbar, color.new(color.lime, 0), size = size.tiny, text = "V", textcolor = color.lime)
+plotshape(signal, "Entrada óptima", shape.labelup, location.belowbar, color.new(#00C853, 0),
+     text = "BUY LMT", textcolor = color.white, size = size.small)
+plotshape(tpHit, "Take Profit", shape.diamond, location.abovebar, color.new(color.teal, 0), size = size.tiny)
+plotshape(slHit, "Stop Loss", shape.xcross, location.abovebar, color.new(color.red, 0), size = size.small)
+
+bgcolor(showERbg and inER ? color.new(color.gray, 85) : na, title = "Ventana de balances")
+
+// --- Panel de estado ---
+var table panel = table.new(position.top_right, 2, 5, bgcolor = color.new(color.gray, 90),
+     border_color = color.new(color.gray, 70), border_width = 1)
+if showPanel and barstate.islast
+    volRatio = volAvg > 0 ? pbVol / volAvg * 100 : na
+    erTxt = inER ? "PAUSA" : na(nextER) ? "s/d" : str.format_time(nextER, "dd/MM/yyyy", syminfo.timezone)
+    opTxt = active ? "Activa · TP " + str.tostring(tpPx, format.mintick) + " / SL " + str.tostring(slPx, format.mintick) : "Sin posición"
+    table.cell(panel, 0, 0, "Tendencia",  text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 0, trendOK ? "OK" : "No", text_color = trendOK ? color.teal : color.red, text_size = size.small)
+    table.cell(panel, 0, 1, "Zona de valor", text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 1, inZone ? "En zona" : "Fuera", text_color = inZone ? color.teal : color.gray, text_size = size.small)
+    table.cell(panel, 0, 2, "Vol. retroceso", text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 2, str.tostring(volRatio, "#") + "% media", text_color = dryUp ? color.teal : color.gray, text_size = size.small)
+    table.cell(panel, 0, 3, "Balances", text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 3, erTxt, text_color = inER ? color.orange : color.gray, text_size = size.small)
+    table.cell(panel, 0, 4, "Operación", text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 4, opTxt, text_color = active ? color.teal : color.gray, text_size = size.small)
+
+// ─────────────────────────── ALERTAS ───────────────────────────
+alertcondition(signal, "🟢 Entrada Óptima Institucional",
+     "⚠️ [SWING INSTITUCIONAL] Precio en Zona de Entrada Límite - Activar Orden")
+alertcondition(slHit, "🛑 Invalidación / Stop Loss",
+     "🛑 [SWING] Stop Loss Técnico Activado (-3%)")
+alertcondition(tpHit, "🎯 Take Profit alcanzado",
+     "🎯 [SWING] Take Profit alcanzado (+4%)")
