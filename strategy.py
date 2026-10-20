@@ -48,6 +48,9 @@ class Params:
     order_valid: int = 3           # velas que la orden límite queda viva
     tech_exit: bool = True         # salir si cierra bajo el soporte con volumen alto
     cost_pct: float = 0.05         # comisión + deslizamiento por lado (%)
+    use_dry: bool = True           # exigir secado de volumen
+    exit_mode: str = "fijo"        # "fijo" (TP fijo) | "rebote" (sale al cerrar sobre la SMA corta)
+    rebote_len: int = 5            # SMA corta para la salida por rebote
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -121,7 +124,8 @@ def compute_indicators(df: pd.DataFrame, p: Params, earnings_dates=None) -> pd.D
     d["pullback"] = (recent_high - d["Low"]) / recent_high * 100 >= p.pb_min
     d["pb_vol"] = d["Volume"].rolling(p.dry_len).mean()
     d["vol_ratio"] = d["pb_vol"] / d["vol_avg"]
-    d["dry_up"] = d["vol_ratio"] < p.dry_mult
+    d["dry_up"] = (d["vol_ratio"] < p.dry_mult) if p.use_dry else True
+    d["sma_exit"] = d["Close"].rolling(p.rebote_len).mean()
 
     d["in_earnings"] = (
         earnings_window(d.index, earnings_dates, p.er_before, p.er_after)
@@ -143,6 +147,8 @@ def backtest(d: pd.DataFrame, p: Params, ticker: str = "") -> pd.DataFrame:
     vol, vavg = d["Volume"].to_numpy(float), d["vol_avg"].to_numpy(float)
     sig, lvl = d["signal"].to_numpy(bool), d["zone_lvl"].to_numpy(float)
     src = d["zone_src"].to_numpy(object)
+    sma_exit = d["sma_exit"].to_numpy(float)
+    fixed_tp = p.exit_mode == "fijo"
     idx = d.index
     tol, cost = p.zone_pct / 100, p.cost_pct / 100
     trades: list[dict] = []
@@ -177,10 +183,12 @@ def backtest(d: pd.DataFrame, p: Params, ticker: str = "") -> pd.DataFrame:
                 exit_t, exit_px, reason = k, o[k], "SL (gap)"
             elif l[k] <= sl:
                 exit_t, exit_px, reason = k, sl, "SL"
-            elif k > fill_t and o[k] >= tp:                     # gap por encima del objetivo
+            elif fixed_tp and k > fill_t and o[k] >= tp:        # gap por encima del objetivo
                 exit_t, exit_px, reason = k, o[k], "TP (gap)"
-            elif h[k] >= tp and (k > fill_t or c[k] >= tp or o[k] >= tp):
+            elif fixed_tp and h[k] >= tp and (k > fill_t or c[k] >= tp or o[k] >= tp):
                 exit_t, exit_px, reason = k, tp, "TP"
+            elif not fixed_tp and k > fill_t and c[k] > sma_exit[k]:
+                exit_t, exit_px, reason = k, c[k], "Rebote"
             elif p.tech_exit and k > fill_t and c[k] < limit * (1 - tol) and vol[k] > vavg[k]:
                 exit_t, exit_px, reason = k, c[k], "Soporte perforado"
             if exit_t is not None:
@@ -307,3 +315,40 @@ def run(df: pd.DataFrame, p: Params, ticker: str = "", earnings_dates=None):
     d = compute_indicators(df, p, earnings_dates)
     trades = backtest(d, p, ticker)
     return d, trades, summarize(trades, d)
+
+
+def period_metrics(results: dict, start=None, end=None) -> dict:
+    """Métricas de la caja (partes iguales entre activos) para las operaciones que
+    ENTRARON dentro de [start, end). `results` = {ticker: (d, trades)}."""
+    start = pd.Timestamp(start) if start is not None else None
+    end = pd.Timestamp(end) if end is not None else None
+    curves, sel = [], []
+    for d, tr in results.values():
+        dd = d
+        if start is not None:
+            dd = dd[dd.index >= start]
+        if end is not None:
+            dd = dd[dd.index < end]
+        if dd.empty:
+            continue
+        t = tr[(tr["status"] == "cerrada") & tr["entry_date"].between(dd.index[0], dd.index[-1])]
+        sel.append(t)
+        curves.append(equity_curve(dd, t))
+    if not curves:
+        return {}
+    port = pd.concat(curves, axis=1).ffill().fillna(1.0).mean(axis=1)
+    allt = pd.concat(sel, ignore_index=True) if sel else pd.DataFrame(columns=["status"])
+    s = summarize(allt)
+    years = (port.index[-1] - port.index[0]).days / 365.25
+    bh = pd.concat([d.loc[port.index[0]:port.index[-1], "Close"] for d, _ in results.values()], axis=1)
+    bh = (bh / bh.bfill().iloc[0]).ffill().mean(axis=1)
+    return {
+        "Operaciones": s["operaciones"],
+        "Ops/año": s["operaciones"] / years if years else np.nan,
+        "Acierto %": s["acierto_pct"],
+        "Resultado medio %": s["esperanza_pct"],
+        "Profit factor": s["profit_factor"],
+        "Caja anual %": (port.iloc[-1] ** (1 / years) - 1) * 100 if years else np.nan,
+        "Peor caída %": max_drawdown(port),
+        "Comprar y mantener anual %": (bh.iloc[-1] ** (1 / years) - 1) * 100 if years else np.nan,
+    }

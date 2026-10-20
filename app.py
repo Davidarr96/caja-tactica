@@ -13,7 +13,10 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 import data as dt
-from strategy import Params, compute_indicators, backtest, summarize, equity_curve, latest_status, max_drawdown
+from dataclasses import replace
+
+from strategy import (Params, compute_indicators, backtest, summarize, equity_curve, latest_status,
+                      max_drawdown, period_metrics)
 
 st.set_page_config(page_title="Caja Táctica · Swing", page_icon="📈", layout="wide")
 
@@ -97,7 +100,8 @@ for e in errors:
 if not results:
     st.stop()
 
-tab_sim, tab_mon, tab_chart, tab_help = st.tabs(["📊 Simulación", "📡 Monitor de hoy", "🕯️ Gráfico", "📘 Cómo funciona"])
+tab_sim, tab_mon, tab_chart, tab_var, tab_help = st.tabs(
+    ["📊 Simulación", "📡 Monitor de hoy", "🕯️ Gráfico", "🧪 Comparar variantes", "📘 Cómo funciona"])
 
 # ───────────────────────────── Simulación ─────────────────────────────
 with tab_sim:
@@ -228,6 +232,50 @@ with tab_chart:
     fig.update_layout(height=640, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10),
                       legend=dict(orientation="h", y=1.04), hovermode="x unified")
     st.plotly_chart(fig, width="stretch")
+
+# ───────────────────────────── Variantes ─────────────────────────────
+BASE = Params()
+VARIANTS = {
+    "A · Original (Hugo)": BASE,
+    "B · Secado más laxo (85 %)": replace(BASE, dry_mult=0.85),
+    "C · Sin salida por soporte": replace(BASE, tech_exit=False),
+    "D · B + C": replace(BASE, dry_mult=0.85, tech_exit=False),
+    "E · Sin filtro de volumen (D sin secado)": replace(BASE, use_dry=False, tech_exit=False),
+    "F · D con TP 6 % / SL 4 %": replace(BASE, dry_mult=0.85, tech_exit=False, tp_pct=6.0, sl_pct=4.0),
+    "G · D con salida por rebote (cierre > SMA 5)": replace(BASE, dry_mult=0.85, tech_exit=False, exit_mode="rebote"),
+}
+SPLIT = "2020-01-01"
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def compare_variants(tickers: tuple, start: str) -> pd.DataFrame:
+    rows = []
+    data = {tk: load(tk, start) for tk in tickers}
+    for name, vp in VARIANTS.items():
+        res = {}
+        for tk, (df, er) in data.items():
+            d = compute_indicators(df, vp, er)
+            res[tk] = (d, backtest(d, vp, tk))
+        for label, a, b in (("Diseño · hasta 2019", None, SPLIT), ("Validación · 2020 a hoy", SPLIT, None),
+                            ("Período completo", None, None)):
+            m = period_metrics(res, a, b)
+            rows.append({"Variante": name, "Período": label, **m})
+    return pd.DataFrame(rows)
+
+
+with tab_var:
+    st.subheader("Comparar variantes de la estrategia")
+    st.caption("Mismos activos y fechas que la barra lateral; las reglas de cada variante son fijas (no usan los controles). "
+               "Primero se mira el período de diseño; la variante elegida tiene que sostenerse en la validación, que no se usó para elegirla.")
+    with st.spinner("Simulando variantes…"):
+        cmp = compare_variants(tuple(results), start)
+    for per in ("Diseño · hasta 2019", "Validación · 2020 a hoy", "Período completo"):
+        st.markdown(f"**{per}**")
+        st.dataframe(cmp[cmp["Período"] == per].drop(columns="Período").set_index("Variante").round(2), width="stretch")
+    st.markdown("""
+- **A** reglas originales · **B** el volumen solo tiene que estar por debajo del 85 % de la media · **C** no corta antes por perforar el soporte
+- **E** prueba si el filtro de volumen aporta algo · **F** objetivo y stop más amplios · **G** sin objetivo fijo: sale el primer día que cierra sobre la media de 5 ruedas (con stop −3 %)
+""")
 
 # ───────────────────────────── Ayuda ─────────────────────────────
 with tab_help:
