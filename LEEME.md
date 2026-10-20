@@ -9,10 +9,10 @@ Sitio web propio para la estrategia de swing institucional: zonas de valor (SMA 
 | `app.py` | El sitio web, con cuatro pestañas: **Simulación** (backtest con resultados y comparación contra comprar y mantener), **Monitor de hoy**, **Gráfico** y **Cómo funciona**. |
 | `strategy.py` | La lógica de la estrategia, igual a la del indicador de TradingView. |
 | `data.py` | Descarga de precios y fechas de balances desde Yahoo Finance. |
-| `scan.py` | Escaneo diario. Manda las alertas por Telegram. |
+| `scan.py` | Escaneo diario. Manda las alertas por ntfy y/o Telegram. |
 | `.github/workflows/escaneo.yml` | Corre `scan.py` solo, de lunes a viernes a las 18:40 hora de Argentina. |
 
-Cuesta $0. Los datos salen de Yahoo Finance, el sitio corre en Streamlit Cloud, las alertas en GitHub Actions y los mensajes llegan por Telegram.
+Cuesta $0. Los datos salen de Yahoo Finance, el sitio corre en Streamlit Cloud, las alertas en GitHub Actions y los mensajes llegan por ntfy (o Telegram).
 
 ---
 
@@ -48,30 +48,22 @@ En la barra de la izquierda podés cambiar los activos, el TP, el SL y las regla
    - Elegí *Create app*, el repositorio y el archivo `app.py`, y dale a *Deploy*.
    - Te da un link propio. En *Settings → Sharing* podés limitar quién lo ve, por ejemplo vos y Hugo.
 
-## Paso 3 · Alertas al celular por Telegram
+## Paso 3 · Alertas al celular (ntfy)
 
-1. **Creá el bot.**
-   - En Telegram, hablale a **@BotFather**.
-   - Mandale `/newbot` y seguí los pasos.
-   - Te da un **token**, algo como `123456:ABC...`. Guardalo.
-2. **Conseguí tu chat id.**
-   - Hablale a **@userinfobot**. Te responde tu **id**, un número.
-   - Después mandale cualquier mensaje a tu bot nuevo, para que tenga permiso de escribirte.
-3. **Cargá los datos en GitHub.**
-   - En el repositorio, entrá a *Settings → Secrets and variables → Actions → New repository secret*.
-   - Creá dos secretos: `TELEGRAM_TOKEN` y `TELEGRAM_CHAT_ID`.
-   - Opcional: en la pestaña *Variables* podés crear `TICKERS`, con un valor como `SPY,QQQ,JPM,GOOGL,KO,MSFT`, para cambiar la lista de activos. También `SOLO_NOVEDADES = 1` si no querés el resumen los días sin señales.
-4. **Probá que funcione.**
-   - En la pestaña *Actions*, elegí **Escaneo diario Caja Táctica → Run workflow**.
-   - En un minuto debería llegarte el mensaje.
-   - A partir de ahí corre solo cada día hábil.
+Todos los días hábiles a las 18:40 hora de Argentina, GitHub corre `scan.py` y manda un resumen con dos secciones:
+**💼 Cartera mejorada** (reglas F, 28 activos, hasta 3 posiciones) y **📈 Estrategia original** (reglas de Hugo sobre 5 activos),
+más los balances y eventos macro de los próximos días. Si hay señales o salidas, llega con prioridad alta.
 
-Para probar el bot desde tu computadora:
-```
-set TELEGRAM_TOKEN=tu_token          (en Mac: export TELEGRAM_TOKEN=tu_token)
-set TELEGRAM_CHAT_ID=tu_id
-python scan.py --prueba
-```
+1. Instalá la app **ntfy** (gratis, Android y iPhone).
+2. Tocá **+** (Suscribirse a un tema) y escribí el nombre del canal que figura en
+   `.github/workflows/escaneo.yml` (línea `NTFY_TOPIC`). No compartas ese nombre: quien lo sepa puede leer las alertas.
+3. Para probar: en GitHub, pestaña *Actions* → **Escaneo diario Caja Táctica** → *Run workflow* → modo `prueba`.
+   Con modo `resumen` manda el resumen completo del día.
+
+Para recibir solo los días con novedades: *Settings → Secrets and variables → Actions → Variables* → crear `SOLO_NOVEDADES` = `1`.
+
+Opcional: también puede mandar por Telegram cargando los secretos `TELEGRAM_TOKEN` y `TELEGRAM_CHAT_ID`
+(bot creado con @BotFather; tu id lo da @userinfobot).
 
 ---
 
