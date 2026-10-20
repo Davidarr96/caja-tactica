@@ -15,6 +15,7 @@ from plotly.subplots import make_subplots
 import data as dt
 from dataclasses import replace
 
+import events as ev
 import portfolio as pf
 from strategy import (Params, compute_indicators, backtest, summarize, equity_curve, latest_status,
                       max_drawdown, period_metrics)
@@ -101,8 +102,9 @@ for e in errors:
 if not results:
     st.stop()
 
-tab_sim, tab_mon, tab_chart, tab_var, tab_port, tab_help = st.tabs(
-    ["📊 Simulación", "📡 Monitor de hoy", "🕯️ Gráfico", "🧪 Comparar variantes", "💼 Cartera mejorada", "📘 Cómo funciona"])
+tab_sim, tab_mon, tab_chart, tab_var, tab_port, tab_help, tab_ins, tab_cal = st.tabs(
+    ["📊 Simulación", "📡 Monitor de hoy", "🕯️ Gráfico", "🧪 Comparar variantes", "💼 Cartera mejorada",
+     "📘 Cómo funciona", "💡 Insights", "📅 Calendario"])
 
 # ───────────────────────────── Simulación ─────────────────────────────
 with tab_sim:
@@ -318,8 +320,10 @@ def run_portfolio(universe: tuple, start: str, rules: str, max_pos: int, cash_ra
     refs = {"Cartera mejorada": eq, "Caja original (5 activos, reglas A)": orig[orig.index >= first],
             "Comprar y mantener SPY": spy[spy.index >= first], "Comprar y mantener la lista (partes iguales)": ew}
     refs = {k: v / v.iloc[0] for k, v in refs.items()}
-    current = {tk: tr[tr["status"].isin(["abierta", "orden pendiente"])] for tk, tr in trades.items()}
-    current = pd.concat(current.values(), ignore_index=True) if current else pd.DataFrame()
+    held = log[(log["tomada"]) & (log["status"] == "abierta")] if len(log) else pd.DataFrame()
+    pend = [tr[tr["status"] == "orden pendiente"] for tr in trades.values()]
+    current = pd.concat([held] + pend, ignore_index=True) if len(held) or any(len(p) for p in pend) else pd.DataFrame(
+        columns=["ticker", "status", "zone", "limit", "entry_date", "entry", "tp", "sl", "ret_pct"])
     return refs, log, expo, fails, current
 
 
@@ -422,3 +426,216 @@ cuenta como pérdida; respeta los gaps; descuenta {P.cost_pct:g} % por lado de c
 **Datos.** Precios diarios de Yahoo Finance ajustados por dividendos. Las fechas de balances también salen de Yahoo
 y pueden estar incompletas en años viejos.
 """)
+
+
+# ───────────────────────────── Insights ─────────────────────────────
+F_KEY, A_KEY = list(RULES)
+DEF_UNI = tuple(t.strip() for t in UNIVERSE.split(","))
+TODAY = pd.Timestamp.today().normalize()
+_DIAS = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
+
+
+def fdate(x, year=True) -> str:
+    x = pd.Timestamp(x)
+    return f"{_DIAS[x.weekday()]} {x:%d/%m}" + (f"/{x:%Y}" if year else "")
+
+
+def upcoming_earnings(tickers) -> pd.DataFrame:
+    rows = []
+    for tk in tickers:
+        try:
+            _, er = load(tk, start)
+        except Exception:  # noqa: BLE001
+            continue
+        nxt = dt.next_earnings(er, TODAY)
+        if nxt is not None:
+            rows.append({"Activo": tk, "Próximo balance": nxt, "En días": (nxt - TODAY).days,
+                         "Pausa desde": nxt - pd.Timedelta(days=Params().er_before)})
+    return pd.DataFrame(rows).sort_values("Próximo balance") if rows else pd.DataFrame(
+        columns=["Activo", "Próximo balance", "En días", "Pausa desde"])
+
+
+with tab_ins:
+    st.subheader("💡 Insights")
+    st.caption("Conclusiones calculadas con los datos actuales. Se recalculan solas cada vez que se actualizan los precios. "
+               "Es un análisis de simulaciones, no una recomendación de inversión.")
+    with st.spinner("Calculando insights…"):
+        cmp_i = compare_variants(tuple(DEFAULT_TICKERS), start)
+        refs_i, log_i, expo_i, _, cur_i = run_portfolio(DEF_UNI, start, F_KEY, 3, 4.0)
+        refs_0 = run_portfolio(DEF_UNI, start, F_KEY, 3, 0.0)[0]
+
+    def g(var, per, col):
+        r = cmp_i[(cmp_i["Variante"].str.startswith(var)) & (cmp_i["Período"].str.startswith(per))]
+        return float(r[col].iloc[0]) if len(r) else np.nan
+
+    st_c = {k: pf.stats(v) for k, v in refs_i.items()}
+    port_cagr, spy_cagr = st_c["Cartera mejorada"]["Anual %"], st_c["Comprar y mantener SPY"]["Anual %"]
+    list_cagr = st_c["Comprar y mantener la lista (partes iguales)"]["Anual %"]
+    orig_cagr = st_c["Caja original (5 activos, reglas A)"]["Anual %"]
+    cash_part = port_cagr - pf.stats(refs_0["Cartera mejorada"])["Anual %"]
+    ratio_p = st_c["Cartera mejorada"]["Anual / caída"]
+    ratio_s = st_c["Comprar y mantener SPY"]["Anual / caída"]
+
+    st.markdown("#### Highlights")
+    cards = [
+        ("🐢", "La estrategia original casi no opera",
+         f"{g('A', 'Período', 'Ops/año'):.1f} operaciones por año entre 5 activos y {g('A', 'Período', 'Acierto %'):.0f}% de acierto "
+         f"(necesita ≈ 43% para empatar). Rinde {fmt_pct(orig_cagr)} anual."),
+        ("🧪", "Las reglas F mejoran y se sostienen",
+         f"Profit factor {g('F', 'Diseño', 'Profit factor'):.2f} en 2012–2019 y {g('F', 'Validación', 'Profit factor'):.2f} "
+         f"en 2020–hoy, con {g('F', 'Período', 'Acierto %'):.0f}% de acierto. La original fue "
+         f"{g('A', 'Diseño', 'Profit factor'):.2f} y {g('A', 'Validación', 'Profit factor'):.2f}."),
+        ("💼", "La cartera mejorada sí rinde",
+         f"{fmt_pct(port_cagr)} anual con la caja completa trabajando, contra {fmt_pct(orig_cagr)} de la caja original. "
+         f"Está invertida el {expo_i.mean() * 100:.0f}% del tiempo."),
+        ("🏦", "Parte del rendimiento es la tasa",
+         f"De ese {fmt_pct(port_cagr, sign=False)}, unos {cash_part:.1f} puntos vienen de la tasa del efectivo (4%). "
+         f"Las operaciones aportan ≈ {port_cagr - cash_part:.1f}% anual."),
+        ("📈", "Comprar y mantener sigue ganando",
+         f"SPY rindió {fmt_pct(spy_cagr)} anual y la lista completa {fmt_pct(list_cagr)}. "
+         f"Por cada punto de caída, la cartera gana {ratio_p:.2f} y SPY {ratio_s:.2f}."),
+        ("🛡️", "Cae menos en las crisis",
+         f"Peor caída de la cartera {fmt_pct(st_c['Cartera mejorada']['Peor caída %'])} contra "
+         f"{fmt_pct(st_c['Comprar y mantener SPY']['Peor caída %'])} de SPY. Ver detalle por episodio abajo."),
+    ]
+    for i in range(0, len(cards), 3):
+        cols = st.columns(3)
+        for col, (icon, title, text) in zip(cols, cards[i:i + 3]):
+            with col.container(border=True):
+                st.markdown(f"**{icon} {title}**")
+                st.write(text)
+
+    st.markdown("#### Cómo le fue en los momentos difíciles")
+    cr = ev.crisis_returns({"Cartera mejorada %": refs_i["Cartera mejorada"],
+                            "SPY %": refs_i["Comprar y mantener SPY"],
+                            "Caja original %": refs_i["Caja original (5 activos, reglas A)"]})
+    st.table(cr.set_index("Episodio").style.format(precision=1, na_rep="—"))
+    fig = go.Figure()
+    for k, sty in (("Cartera mejorada", dict(width=2.6, color="#1f9d74")),
+                   ("Comprar y mantener SPY", dict(width=1.4, color="#5b6b8c"))):
+        v = refs_i[k]
+        fig.add_scatter(x=v.index, y=(v - 1) * 100, name=k, line=sty)
+    for name, a, b in ev.CRISES:
+        fig.add_vrect(x0=a, x1=b, fillcolor="#ef5350", opacity=0.13, line_width=0,
+                      annotation_text=name, annotation_position="top left", annotation_font_size=10,
+                      annotation_textangle=-90)
+    fig.update_layout(height=430, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="Rendimiento acumulado (%)",
+                      legend=dict(orientation="h", y=1.12), hovermode="x unified")
+    st.plotly_chart(fig, width="stretch")
+    worse = cr.dropna(subset=["Cartera mejorada %", "SPY %"])
+    better_n = int((worse["Cartera mejorada %"] > worse["SPY %"]).sum())
+    st.caption(f"En {better_n} de {len(worse)} episodios la cartera perdió menos que SPY. Ayuda que esté parte del tiempo "
+               "en efectivo; la contracara es que también se pierde parte de las subas.")
+
+    st.markdown("#### Recomendaciones para los próximos pasos")
+    recs = []
+    if g("F", "Validación", "Profit factor") > g("A", "Validación", "Profit factor") or \
+            g("F", "Período", "Profit factor") > g("A", "Período", "Profit factor"):
+        recs.append("**Usar las reglas F en lugar de las originales.** Fueron mejores en el período de diseño y se "
+                    "sostuvieron en la validación; las originales operan tan poco que sus números no son confiables.")
+    recs.append("**Usar la caja completa con pocas posiciones (pestaña Cartera mejorada).** Repartirla en partes fijas por "
+                "activo deja casi toda la plata quieta.")
+    if port_cagr < spy_cagr:
+        recs.append(f"**No esperar que la caja táctica le gane al core.** En la simulación rindió {fmt_pct(port_cagr)} "
+                    f"contra {fmt_pct(spy_cagr)} de SPY, y tampoco gana ajustando por riesgo. Si la usan, que sea un "
+                    "porcentaje chico, como plantea Hugo, y con expectativas acordes.")
+    recs.append("**Probar en papel antes de poner plata.** Activar las alertas de Telegram y anotar 2 o 3 meses de señales "
+                "reales; recién ahí comparar con lo que dice la simulación.")
+    recs.append("**Mirar el calendario antes de cada orden.** Además de los balances (que la estrategia ya evita), las "
+                "decisiones de la Fed y los datos de inflación y empleo suelen mover todo el mercado el mismo día.")
+    recs.append("**Tener presente el sesgo de supervivencia.** La lista usa empresas que hoy son grandes; el pasado real "
+                "habría sido algo peor tanto para la estrategia como para comprar y mantener esa lista.")
+    for i, r in enumerate(recs, 1):
+        st.markdown(f"{i}. {r}")
+
+    st.markdown("#### Para esta semana")
+    macro = ev.macro_calendar()
+    soon = macro[(macro["Fecha"] >= TODAY) & (macro["Fecha"] <= TODAY + pd.Timedelta(days=14))]
+    held = sorted(set(cur_i["ticker"])) if len(cur_i) else []
+    ue = upcoming_earnings(held)
+    bullets = []
+    if held:
+        for _, r in cur_i.iterrows():
+            if r["status"] == "abierta":
+                bullets.append(f"Posición abierta en **{r['ticker']}** desde {r['entry_date']:%d/%m} "
+                               f"(TP {r['tp']:.2f} · SL {r['sl']:.2f} · va {r['ret_pct']:+.1f}%).")
+            else:
+                bullets.append(f"Orden límite pendiente en **{r['ticker']}** a {r['limit']:.2f}.")
+        for _, r in ue[ue["En días"] <= 21].iterrows():
+            bullets.append(f"⚠️ **{r['Activo']}** presenta balance el {r['Próximo balance']:%d/%m} "
+                           f"(en {r['En días']} días): riesgo de salto de precio con la posición abierta.")
+    else:
+        bullets.append("La cartera mejorada no tiene posiciones abiertas ni órdenes pendientes.")
+    for _, r in soon.iterrows():
+        bullets.append(f"📅 {fdate(r['Fecha'], False)}: {r['Evento']}.")
+    if soon.empty:
+        bullets.append("No hay eventos macro importantes en los próximos 14 días.")
+    for b in bullets:
+        st.markdown(f"- {b}")
+
+
+# ───────────────────────────── Calendario ─────────────────────────────
+with tab_cal:
+    st.subheader("📅 Calendario")
+    c1, c2 = st.columns([2, 1])
+    which = c1.radio("Activos", ["Lista de la cartera mejorada", "Activos de la barra lateral"], horizontal=True)
+    horizon = c2.slider("Próximos días", 14, 180, 60)
+    cal_t = DEF_UNI if which.startswith("Lista") else tuple(results)
+    end = TODAY + pd.Timedelta(days=horizon)
+
+    with st.spinner("Buscando fechas de balances…"):
+        ue = upcoming_earnings(cal_t)
+    held = set(cur_i["ticker"]) if len(cur_i) else set()
+    ue_h = ue[ue["Próximo balance"] <= end].copy()
+    macro = ev.macro_calendar()
+    mac_h = macro[(macro["Fecha"] >= TODAY) & (macro["Fecha"] <= end)]
+
+    m = st.columns(4)
+    m[0].metric("Balances en el período", len(ue_h))
+    m[1].metric("Decisiones de la Fed", int((mac_h["Tipo"] == "Fed (FOMC)").sum()))
+    m[2].metric("Datos de inflación y empleo", int(mac_h["Tipo"].isin(["Inflación (CPI)", "Empleo (NFP)"]).sum()))
+    nxt = mac_h.iloc[0] if len(mac_h) else None
+    m[3].metric("Próximo evento macro", f"{nxt['Fecha']:%d/%m}" if nxt is not None else "—",
+                nxt["Tipo"] if nxt is not None else None, delta_color="off")
+
+    tl = pd.concat([
+        pd.DataFrame({"Fecha": ue_h["Próximo balance"], "Fila": "Balances",
+                      "Texto": ue_h["Activo"] + np.where(ue_h["Activo"].isin(held), " ●", "")}),
+        pd.DataFrame({"Fecha": mac_h["Fecha"], "Fila": mac_h["Tipo"], "Texto": mac_h["Evento"]}),
+    ], ignore_index=True)
+    if len(tl):
+        colors = {"Balances": "#1f9d74", "Fed (FOMC)": "#c62828", "Inflación (CPI)": "#ef6c00",
+                  "Empleo (NFP)": "#6a1b9a", "Mercado": "#78909c"}
+        fig = go.Figure()
+        for fila, grp in tl.groupby("Fila"):
+            fig.add_scatter(x=grp["Fecha"], y=[fila] * len(grp), mode="markers+text", name=fila,
+                            text=grp["Texto"] if fila == "Balances" else None, textposition="top center",
+                            textfont=dict(size=9), hovertext=grp["Texto"], hoverinfo="text+x",
+                            marker=dict(size=11, color=colors.get(fila, "#888"), symbol="diamond"))
+        fig.add_vline(x=TODAY, line_dash="dot", line_color="#888")
+        fig.update_layout(height=340, margin=dict(l=10, r=10, t=20, b=10), showlegend=False,
+                          yaxis=dict(categoryorder="array",
+                                     categoryarray=["Mercado", "Empleo (NFP)", "Inflación (CPI)", "Fed (FOMC)", "Balances"]))
+        st.plotly_chart(fig, width="stretch")
+        st.caption("● = activo con posición abierta u orden pendiente en la cartera mejorada.")
+
+    a, b = st.columns(2)
+    with a:
+        st.markdown("**Balances trimestrales**")
+        if len(ue_h):
+            show = ue_h.assign(**{"Posición": ue_h["Activo"].isin(held).map({True: "● Sí", False: ""})})
+            show["Próximo balance"] = show["Próximo balance"].map(fdate)
+            show["Pausa desde"] = show["Pausa desde"].map(lambda x: fdate(x, False))
+            st.table(show.set_index("Activo"))
+        else:
+            st.info("Sin balances en el período (los ETF como SPY o QQQ no presentan balances).")
+        st.caption(f"La estrategia no abre posiciones desde {Params().er_before} días antes hasta "
+                   f"{Params().er_after} días después de cada reporte. Fechas de Yahoo Finance; "
+                   "algunas son estimadas hasta que la empresa las confirma.")
+    with b:
+        st.markdown("**Eventos que mueven todo el mercado**")
+        if len(mac_h):
+            st.table(mac_h.assign(Fecha=mac_h["Fecha"].map(fdate))[["Fecha", "Tipo", "Evento"]].set_index("Fecha"))
+        st.caption(f"Fuentes oficiales: [Reserva Federal]({ev.FED_URL}) · [Inflación BLS]({ev.CPI_URL}) · "
+                   f"[Empleo BLS]({ev.NFP_URL}) · [Feriados NYSE]({ev.NYSE_URL}). "
+                   "Las fechas de la Fed de 2027 son tentativas.")
