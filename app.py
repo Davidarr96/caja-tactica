@@ -271,7 +271,8 @@ with tab_var:
         cmp = compare_variants(tuple(results), start)
     for per in ("Diseño · hasta 2019", "Validación · 2020 a hoy", "Período completo"):
         st.markdown(f"**{per}**")
-        st.dataframe(cmp[cmp["Período"] == per].drop(columns="Período").set_index("Variante").round(2), width="stretch")
+        st.table(cmp[cmp["Período"] == per].drop(columns="Período").set_index("Variante")
+                 .style.format(precision=1, na_rep="—").format({"Profit factor": "{:.2f}", "Operaciones": "{:.0f}"}))
     st.markdown("""
 - **A** reglas originales · **B** el volumen solo tiene que estar por debajo del 85 % de la media · **C** no corta antes por perforar el soporte
 - **E** prueba si el filtro de volumen aporta algo · **F** objetivo y stop más amplios · **G** sin objetivo fijo: sale el primer día que cierra sobre la media de 5 ruedas (con stop −3 %)
