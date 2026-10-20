@@ -15,6 +15,7 @@ from plotly.subplots import make_subplots
 import data as dt
 from dataclasses import replace
 
+import portfolio as pf
 from strategy import (Params, compute_indicators, backtest, summarize, equity_curve, latest_status,
                       max_drawdown, period_metrics)
 
@@ -100,8 +101,8 @@ for e in errors:
 if not results:
     st.stop()
 
-tab_sim, tab_mon, tab_chart, tab_var, tab_help = st.tabs(
-    ["📊 Simulación", "📡 Monitor de hoy", "🕯️ Gráfico", "🧪 Comparar variantes", "📘 Cómo funciona"])
+tab_sim, tab_mon, tab_chart, tab_var, tab_port, tab_help = st.tabs(
+    ["📊 Simulación", "📡 Monitor de hoy", "🕯️ Gráfico", "🧪 Comparar variantes", "💼 Cartera mejorada", "📘 Cómo funciona"])
 
 # ───────────────────────────── Simulación ─────────────────────────────
 with tab_sim:
@@ -277,6 +278,127 @@ with tab_var:
 - **A** reglas originales · **B** el volumen solo tiene que estar por debajo del 85 % de la media · **C** no corta antes por perforar el soporte
 - **E** prueba si el filtro de volumen aporta algo · **F** objetivo y stop más amplios · **G** sin objetivo fijo: sale el primer día que cierra sobre la media de 5 ruedas (con stop −3 %)
 """)
+
+# ───────────────────────────── Cartera mejorada ─────────────────────────────
+UNIVERSE = ("SPY, QQQ, DIA, IWM, XLF, XLK, XLV, XLP, XLE, XLI, XLU, AAPL, MSFT, GOOGL, AMZN, JPM, V, MA, "
+            "JNJ, PG, KO, PEP, WMT, HD, UNH, XOM, COST, MCD")
+RULES = {
+    "F · TP 6 % / SL 4 %, secado 85 %, sin salida por soporte": replace(
+        Params(), dry_mult=0.85, tech_exit=False, tp_pct=6.0, sl_pct=4.0),
+    "A · Reglas originales de Hugo": Params(),
+}
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def run_portfolio(universe: tuple, start: str, rules: str, max_pos: int, cash_rate: float):
+    rp = RULES[rules]
+    data, trades, fails = {}, {}, []
+    for tk in universe:
+        try:
+            df, er = load(tk, start)
+            d = compute_indicators(df, rp, er)
+            data[tk], trades[tk] = d, backtest(d, rp, tk)
+        except Exception:  # noqa: BLE001
+            fails.append(tk)
+    first = max(d.index[0] for d in data.values())   # arranca cuando todos tienen datos
+    eq, log, expo = pf.simulate(data, trades, max_pos, cash_rate, rp.cost_pct, start=first)
+
+    # Referencias: caja original (5 activos, reglas A, una parte fija por activo) y comprar y mantener
+    base = Params()
+    curves = []
+    for tk in DEFAULT_TICKERS:
+        df, er = load(tk, start)
+        d = compute_indicators(df, base, er)
+        curves.append(equity_curve(d, backtest(d, base, tk)))
+    orig = pd.concat(curves, axis=1).ffill().fillna(1.0).mean(axis=1)
+    spy = load("SPY", start)[0]["Close"]
+    ew = pd.concat({tk: d["Close"] for tk, d in data.items()}, axis=1).ffill()
+    ew = ew[ew.index >= first]
+    ew = (ew / ew.iloc[0]).mean(axis=1)
+    refs = {"Cartera mejorada": eq, "Caja original (5 activos, reglas A)": orig[orig.index >= first],
+            "Comprar y mantener SPY": spy[spy.index >= first], "Comprar y mantener la lista (partes iguales)": ew}
+    refs = {k: v / v.iloc[0] for k, v in refs.items()}
+    current = {tk: tr[tr["status"].isin(["abierta", "orden pendiente"])] for tk, tr in trades.items()}
+    current = pd.concat(current.values(), ignore_index=True) if current else pd.DataFrame()
+    return refs, log, expo, fails, current
+
+
+with tab_port:
+    st.subheader("Cartera mejorada")
+    st.markdown("Tres cambios respecto de la simulación original, que sigue igual en la primera pestaña:  \n"
+                "**1.** toda la caja trabaja junta, en hasta *N* posiciones a la vez · "
+                "**2.** busca señales en una lista amplia de activos · "
+                "**3.** la plata que espera una señal rinde una tasa (caución / letras del Tesoro).")
+    c1, c2, c3 = st.columns([2, 1, 1])
+    rules = c1.selectbox("Reglas de entrada y salida", list(RULES))
+    max_pos = c2.slider("Posiciones simultáneas", 1, 6, 3)
+    cash_rate = c3.number_input("Tasa del efectivo (% anual en USD)", 0.0, 10.0, 4.0, 0.5)
+    uni_txt = st.text_area("Lista de activos", UNIVERSE, height=70)
+    universe = tuple(dict.fromkeys(t.strip().upper() for t in uni_txt.split(",") if t.strip()))
+
+    with st.spinner(f"Simulando la cartera con {len(universe)} activos (la primera vez tarda un poco)…"):
+        refs, plog, expo, fails, current = run_portfolio(universe, start, rules, max_pos, cash_rate)
+    if fails:
+        st.warning("No se pudieron cargar: " + ", ".join(fails))
+
+    eqp = refs["Cartera mejorada"]
+    full = {k: pf.stats(v) for k, v in refs.items()}
+    taken = plog[plog["tomada"]] if len(plog) else plog
+    closed_t = taken[taken["status"] == "cerrada"] if len(taken) else taken
+    yrs = (eqp.index[-1] - eqp.index[0]).days / 365.25
+    m = st.columns(5)
+    m[0].metric("Rentabilidad anual", fmt_pct(full["Cartera mejorada"]["Anual %"]),
+                f"caja original: {fmt_pct(full['Caja original (5 activos, reglas A)']['Anual %'])}", delta_color="off")
+    m[1].metric("Peor caída", fmt_pct(full["Cartera mejorada"]["Peor caída %"]),
+                f"SPY: {fmt_pct(full['Comprar y mantener SPY']['Peor caída %'])}", delta_color="off")
+    m[2].metric("Tiempo invertido (promedio)", f"{expo.mean() * 100:.0f}%")
+    m[3].metric("Operaciones tomadas", f"{len(taken)}", f"{len(taken) / yrs:.0f} por año · {int((~plog['tomada']).sum()) if len(plog) else 0} omitidas por falta de lugar",
+                delta_color="off")
+    m[4].metric("Acierto", fmt_pct(len(closed_t[closed_t["ret_pct"] > 0]) / len(closed_t) * 100, 0, False) if len(closed_t) else "—")
+
+    fig = go.Figure()
+    styles = {"Cartera mejorada": dict(width=2.8, color="#1f9d74"),
+              "Caja original (5 activos, reglas A)": dict(width=1.8, color="#e8a33d"),
+              "Comprar y mantener SPY": dict(width=1.4, color="#5b6b8c", dash="dot"),
+              "Comprar y mantener la lista (partes iguales)": dict(width=1.4, color="#9aa0a8", dash="dash")}
+    for k, v in refs.items():
+        fig.add_scatter(x=v.index, y=(v - 1) * 100, name=k, line=styles[k])
+    fig.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Rendimiento acumulado (%)",
+                      legend=dict(orientation="h", y=1.1), hovermode="x unified")
+    st.plotly_chart(fig, width="stretch")
+
+    st.markdown("**Comparación por período**")
+    rows = []
+    for per, a, b in (("Diseño · hasta 2019", None, SPLIT), ("Validación · 2020 a hoy", SPLIT, None), ("Período completo", None, None)):
+        for k, v in refs.items():
+            rows.append({"Período": per, "Serie": k, **pf.stats(v, a, b)})
+    st.table(pd.DataFrame(rows).set_index(["Período", "Serie"])
+             .style.format(precision=1, na_rep="—").format({"Anual / caída": "{:.2f}"}))
+    st.caption("“Anual / caída” = rentabilidad anual dividida por la peor caída: cuánto se gana por cada punto de caída soportado. "
+               "Más alto es mejor.")
+
+    st.markdown("**Posiciones y órdenes al último cierre**")
+    if len(current):
+        cur = current[["ticker", "status", "zone", "limit", "entry_date", "entry", "tp", "sl", "ret_pct"]].rename(
+            columns={"ticker": "Activo", "status": "Estado", "zone": "Zona", "limit": "Límite", "entry_date": "Entrada",
+                     "entry": "Precio entrada", "tp": "TP", "sl": "SL", "ret_pct": "Va %"})
+        st.table(cur.style.format(precision=2, na_rep="—"))
+    else:
+        st.info("Ningún activo de la lista tiene una posición abierta ni una orden pendiente hoy.")
+
+    st.markdown("**Últimas operaciones de la cartera**")
+    if len(taken):
+        last = taken.sort_values("entry_date", ascending=False).head(40)
+        last = last[["ticker", "entry_date", "entry", "exit_date", "exit", "reason", "ret_pct", "peso_pct"]].rename(
+            columns={"ticker": "Activo", "entry_date": "Entrada", "entry": "Precio entrada", "exit_date": "Salida",
+                     "exit": "Precio salida", "reason": "Motivo", "ret_pct": "Resultado %", "peso_pct": "Peso en cartera %"})
+        st.dataframe(last.round({"Precio entrada": 2, "Precio salida": 2, "Resultado %": 2, "Peso en cartera %": 1}),
+                     width="stretch", height=320)
+        st.download_button("Descargar operaciones de la cartera (CSV)", taken.to_csv(index=False).encode(),
+                           "cartera_operaciones.csv", "text/csv")
+    st.caption("Atención: la lista usa empresas que hoy son grandes y exitosas. En el pasado no siempre se sabía cuáles iban a "
+               "serlo, así que los resultados históricos de la lista tienden a verse mejor de lo que habrían sido "
+               "(sesgo de supervivencia). Afecta por igual a la estrategia y a “comprar y mantener la lista”.")
 
 # ───────────────────────────── Ayuda ─────────────────────────────
 with tab_help:
