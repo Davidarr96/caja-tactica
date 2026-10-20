@@ -44,6 +44,13 @@ def fmt_pct(x, dec=1, sign=True):
 # ───────────────────────────── Barra lateral ─────────────────────────────
 st.sidebar.title("📈 Caja Táctica")
 st.sidebar.caption("Swing institucional · TP +4 % / SL −3 %")
+if st.sidebar.button("🔄 Actualizar datos ahora", width="stretch",
+                     help="Vuelve a bajar los precios y las fechas de balances sin esperar las 6 horas de la caché."):
+    st.cache_data.clear()
+    st.session_state["ultima_act"] = pd.Timestamp.now(tz="America/Argentina/Buenos_Aires")
+    st.rerun()
+if "ultima_act" in st.session_state:
+    st.sidebar.caption(f"Actualizado a las {st.session_state['ultima_act']:%H:%M} (hora de Argentina)")
 
 tickers = st.sidebar.multiselect("Activos", DEFAULT_TICKERS + ["MSFT", "AAPL", "JNJ", "PG", "V", "DIA"],
                                  default=DEFAULT_TICKERS)
@@ -99,6 +106,9 @@ with st.spinner("Descargando datos y simulando…"):
             errors.append(f"{tk}: {e}")
 for e in errors:
     st.error(f"No se pudo cargar {e}")
+if results:
+    _last = max(r["d"].index[-1] for r in results.values())
+    st.sidebar.caption(f"Último dato de precios: {_last:%d/%m/%Y}")
 if not results:
     st.stop()
 
