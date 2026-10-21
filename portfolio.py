@@ -19,7 +19,8 @@ from strategy import max_drawdown
 
 
 def simulate(data: dict, trades: dict, max_pos: int = 3, cash_rate: float = 4.0,
-             cost_pct: float = 0.05, start=None) -> tuple[pd.Series, pd.DataFrame, pd.Series]:
+             cost_pct: float = 0.05, start=None,
+             cash_returns: pd.Series | None = None) -> tuple[pd.Series, pd.DataFrame, pd.Series]:
     """
     data:   {ticker: DataFrame con Close (y el resto)}
     trades: {ticker: DataFrame de backtest()} — se usan las operaciones cerradas y la abierta
@@ -31,6 +32,8 @@ def simulate(data: dict, trades: dict, max_pos: int = 3, cash_rate: float = 4.0,
     dates = closes.index
     cost = cost_pct / 100
     daily_rate = (1 + cash_rate / 100) ** (1 / 252) - 1
+    # Si se pasa `cash_returns` (rendimientos diarios reales, p. ej. del ETF BIL), reemplaza a la tasa fija.
+    cash_r = cash_returns.reindex(dates).fillna(0.0) if cash_returns is not None else None
 
     allt = []
     for tk, tr in trades.items():
@@ -50,7 +53,7 @@ def simulate(data: dict, trades: dict, max_pos: int = 3, cash_rate: float = 4.0,
 
     for date in dates:
         row = closes.loc[date]
-        cash *= 1 + daily_rate
+        cash *= 1 + (cash_r.loc[date] if cash_r is not None else daily_rate)
         # 1) salidas del día
         still = []
         for p in positions:

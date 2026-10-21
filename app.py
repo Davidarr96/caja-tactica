@@ -17,6 +17,7 @@ from dataclasses import replace
 
 import events as ev
 import portfolio as pf
+import rotation as ro
 from strategy import (Params, compute_indicators, backtest, summarize, equity_curve, latest_status,
                       max_drawdown, period_metrics)
 
@@ -112,9 +113,9 @@ if results:
 if not results:
     st.stop()
 
-tab_sim, tab_mon, tab_chart, tab_var, tab_port, tab_help, tab_ins, tab_cal = st.tabs(
+tab_sim, tab_mon, tab_chart, tab_var, tab_port, tab_help, tab_ins, tab_cal, tab_rot = st.tabs(
     ["📊 Simulación", "📡 Monitor de hoy", "🕯️ Gráfico", "🧪 Comparar variantes", "💼 Cartera mejorada",
-     "📘 Cómo funciona", "💡 Insights", "📅 Calendario"])
+     "📘 Cómo funciona", "💡 Insights", "📅 Calendario", "🐢 Estrategias mensuales"])
 
 # ───────────────────────────── Simulación ─────────────────────────────
 with tab_sim:
@@ -649,3 +650,140 @@ with tab_cal:
         st.caption(f"Fuentes oficiales: [Reserva Federal]({ev.FED_URL}) · [Inflación BLS]({ev.CPI_URL}) · "
                    f"[Empleo BLS]({ev.NFP_URL}) · [Feriados NYSE]({ev.NYSE_URL}). "
                    "Las fechas de la Fed de 2027 son tentativas.")
+
+
+# ───────────────────────────── Estrategias mensuales ─────────────────────────────
+ROT_START = "2005-01-01"   # historia extra para calcular medias y momentum antes del período evaluado
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def run_rotations(start_: str, cost: float):
+    tks = sorted(set(sum((v["tickers"] for v in ro.STRATEGIES.values()), [])))
+    closes = pd.concat({tk: load(tk, ROT_START)[0]["Close"] for tk in tks}, axis=1).sort_index().ffill()
+    out = {}
+    for name, spec in ro.STRATEGIES.items():
+        sub = closes[spec["tickers"]].dropna()
+        eq, tr, ex, W = ro.run(name, sub, cost, start_)
+        out[name] = dict(eq=eq, trades=tr, expo=ex, W=W)
+    return out, closes
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def port_real_cash(universe: tuple, start_: str, rules: str, max_pos: int):
+    """Cartera mejorada con el efectivo rindiendo las letras del Tesoro reales (BIL) en vez de una tasa fija."""
+    rp = RULES[rules]
+    data, trades = {}, {}
+    for tk in universe:
+        try:
+            df, er = load(tk, start_)
+            d = compute_indicators(df, rp, er)
+            data[tk], trades[tk] = d, backtest(d, rp, tk)
+        except Exception:  # noqa: BLE001
+            pass
+    first = max(d.index[0] for d in data.values())
+    bil = load(ro.CASH, ROT_START)[0]["Close"].pct_change()
+    eq, log, expo = pf.simulate(data, trades, max_pos, 0.0, rp.cost_pct, start=first, cash_returns=bil)
+    return eq, log, expo
+
+
+with tab_rot:
+    st.subheader("🐢 Estrategias mensuales: pocas operaciones por año")
+    st.markdown("Se revisan **una vez por mes** (último día hábil) y casi siempre la respuesta es *no hacer nada*. "
+                "Son reglas públicas y conocidas, no ajustadas por nosotros a estos datos.")
+    with st.spinner("Simulando estrategias mensuales (la primera vez tarda un poco)…"):
+        rot, rcl = run_rotations(start, P.cost_pct)
+        peq, plog, pexpo = port_real_cash(DEF_UNI, start, F_KEY, 3)
+
+    eval_start = max([pd.Timestamp(start) + pd.DateOffset(years=1)] + [r["eq"].index[0] for r in rot.values()])
+    series = {k: r["eq"] for k, r in rot.items()}
+    series["Cartera mejorada (efectivo a tasa real)"] = peq
+    series["Comprar y mantener SPY"] = rcl["SPY"]
+    series = {k: (v[v.index >= eval_start] / v[v.index >= eval_start].iloc[0]) for k, v in series.items()}
+    yrs = (series["Comprar y mantener SPY"].index[-1] - eval_start).days / 365.25
+
+    def ops_year(k):
+        if k in rot:
+            t = rot[k]["trades"]
+            return (t["Entrada"] >= eval_start).sum() / yrs if len(t) else 0.0
+        if k.startswith("Cartera"):
+            tk_ = plog[plog["tomada"]] if len(plog) else plog
+            return (tk_["entry_date"] >= eval_start).sum() / yrs if len(tk_) else 0.0
+        return 0.0
+
+    def expo_avg(k):
+        if k in rot:
+            return rot[k]["expo"][rot[k]["expo"].index >= eval_start].mean() * 100
+        if k.startswith("Cartera"):
+            return pexpo[pexpo.index >= eval_start].mean() * 100
+        return 100.0
+
+    rows = []
+    for k, v in series.items():
+        stt = pf.stats(v)
+        rows.append({"Estrategia": k, "Operaciones por año": ops_year(k), "Anual %": stt["Anual %"],
+                     "Peor caída %": stt["Peor caída %"], "Anual / caída": stt["Anual / caída"],
+                     "Volatilidad %": stt["Volatilidad %"], "Tiempo en acciones %": expo_avg(k)})
+    tab = pd.DataFrame(rows).set_index("Estrategia")
+
+    best = tab.drop(index="Comprar y mantener SPY")["Anual / caída"].idxmax()
+    cm = tab.loc["Cartera mejorada (efectivo a tasa real)"]
+    cols = st.columns(len(ro.STRATEGIES))
+    for col, name in zip(cols, ro.STRATEGIES):
+        r = tab.loc[name]
+        col.metric(name, fmt_pct(r["Anual %"]) + " anual",
+                   f"{r['Operaciones por año']:.1f} operaciones/año · caída {r['Peor caída %']:.0f}%", delta_color="off")
+    st.caption(f"Desde {eval_start:%m/%Y}. Referencias: cartera mejorada {fmt_pct(cm['Anual %'])} anual con "
+               f"{cm['Operaciones por año']:.0f} operaciones/año · comprar y mantener SPY "
+               f"{fmt_pct(tab.loc['Comprar y mantener SPY', 'Anual %'])} sin operar. "
+               f"Mejor relación ganancia/caída: **{best}**.")
+
+    st.table(tab.style.format(precision=1, na_rep="—").format({"Anual / caída": "{:.2f}"}))
+    st.caption("Operación = comprar un activo y después venderlo (mover la plata a letras del Tesoro no cuenta). "
+               "“Anual / caída” = rentabilidad anual dividida por la peor caída: más alto es mejor.")
+
+    fig = go.Figure()
+    palette = ["#1f9d74", "#2962FF", "#AB47BC", "#e8a33d", "#5b6b8c"]
+    for (k, v), c in zip(series.items(), palette):
+        fig.add_scatter(x=v.index, y=(v - 1) * 100, name=k,
+                        line=dict(width=1.5 if k.startswith(("Comprar", "Cartera")) else 2.4, color=c,
+                                  dash="dot" if k.startswith("Comprar") else None))
+    fig.update_layout(height=430, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Rendimiento acumulado (%)",
+                      legend=dict(orientation="h", y=1.12), hovermode="x unified")
+    st.plotly_chart(fig, width="stretch")
+
+    st.markdown("**¿Se sostiene en distintas épocas?**")
+    rows = []
+    for per, a, b in ((f"{eval_start:%Y}–2019", None, SPLIT), ("2020 a hoy", SPLIT, None)):
+        for k, v in series.items():
+            stt = pf.stats(v, a, b)
+            rows.append({"Período": per, "Estrategia": k, "Anual %": stt.get("Anual %"),
+                         "Peor caída %": stt.get("Peor caída %"), "Anual / caída": stt.get("Anual / caída")})
+    st.table(pd.DataFrame(rows).set_index(["Período", "Estrategia"]).style.format(precision=1, na_rep="—")
+             .format({"Anual / caída": "{:.2f}"}))
+
+    st.markdown("**En los momentos difíciles**")
+    cr = ev.crisis_returns({f"{k} %": v for k, v in series.items()})
+    cr = cr[pd.to_datetime(cr["Desde"]) >= eval_start]
+    st.table(cr.set_index("Episodio").style.format(precision=1, na_rep="—"))
+
+    st.markdown("**Qué tendría cada una hoy**")
+    nxt = ro.next_rebalance(TODAY)
+    rows = []
+    for name, r in rot.items():
+        W = r["W"]
+        last_w = W.iloc[-1]
+        changes = W.ne(W.shift()).any(axis=1)
+        since = W.index[changes][-1] if changes.any() else W.index[0]
+        rows.append({"Estrategia": name, "Posición": ro.describe(last_w), "Decidida al cierre del": fdate(W.index[-1]),
+                     "Sin cambios desde": fdate(since), "Próxima revisión": fdate(nxt)})
+    st.table(pd.DataFrame(rows).set_index("Estrategia"))
+    st.caption("La próxima revisión es el último día hábil del mes; la orden se ejecuta al día siguiente. "
+               "Si la posición no cambia, no hay que hacer nada.")
+
+    with st.expander("Reglas de cada estrategia"):
+        for name, spec in ro.STRATEGIES.items():
+            st.markdown(f"**{name}** ({spec['origen']}). {spec['regla']}")
+        st.markdown("El efectivo rinde lo que rindieron de verdad las letras del Tesoro de EE.UU. (ETF BIL): casi 0 % "
+                    "hasta 2021 y alrededor de 4–5 % desde 2023. Por eso la cartera mejorada de esta pestaña rinde menos "
+                    "que en su propia pestaña, donde la tasa es fija y editable. Costos: "
+                    f"{P.cost_pct:g} % por cada compra o venta.")
